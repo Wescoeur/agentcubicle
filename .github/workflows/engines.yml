@@ -95,6 +95,32 @@ jobs:
           echo "--- rtkprobe.txt (--no-rtk run) ---"; cat rtkprobe.txt
           grep -q "plugin absent" rtkprobe.txt
 
+      # ponytail is instruction-only (no binary, no plugin), so nothing is baked
+      # into the image; agentcubicle seeds its ruleset into the project's
+      # .agentcubicle/ dir on an opencode run, unless --no-ponytail. Driven
+      # headlessly like the rtk assertion. The file lives in the persistent
+      # project mount, so the --no-ponytail leg must start from a clean
+      # .agentcubicle/ to prove the flag suppresses the write, not a re-read.
+      - name: Assert ponytail ruleset wiring
+        run: |
+          set -euxo pipefail
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          rm -f ponytailprobe.txt
+          # Default opencode run: ponytail ruleset seeded into the project mount.
+          AGENTCUBICLE_TEST_CMD='ls -l /home/user/project/.agentcubicle/ponytail.md > /home/user/project/ponytailprobe.txt 2>&1 || echo "ponytail absent" >> /home/user/project/ponytailprobe.txt' \
+            ./agentcubicle opencode
+          echo "--- ponytailprobe.txt (default run) ---"; cat ponytailprobe.txt
+          grep -q "ponytail.md" ponytailprobe.txt
+          # The seeded content is a verbatim copy of ponytail's ruleset.
+          grep -q "lazy senior dev" .agentcubicle/ponytail.md
+          # --no-ponytail: ruleset not seeded. .agentcubicle/ persists across runs
+          # in this job (it is in the project mount), so clear it first.
+          rm -f .agentcubicle/ponytail.md ponytailprobe.txt
+          AGENTCUBICLE_TEST_CMD='ls -l /home/user/project/.agentcubicle/ponytail.md > /home/user/project/ponytailprobe.txt 2>&1 || echo "ponytail absent" >> /home/user/project/ponytailprobe.txt' \
+            ./agentcubicle opencode --no-ponytail
+          echo "--- ponytailprobe.txt (--no-ponytail run) ---"; cat ponytailprobe.txt
+          grep -q "ponytail absent" ponytailprobe.txt
+
       # Containers are removed when the tool exits; --keep-container opts out.
       - name: Assert container removal on exit
         run: |

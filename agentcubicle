@@ -11,7 +11,7 @@
 #   agentcubicle shell [--name NAME]                     # Shell into running container
 #   agentcubicle commit [--name NAME]                     # Commit running container
 #   agentcubicle cleanup                                  # Remove stopped containers
-#   agentcubicle <opencode|claude> [--mount MOUNT] [--env ENV] [--img IMAGE] [--name NAME] [--keep-container] [--] [tool args...]
+#   agentcubicle <opencode|claude> [--mount MOUNT] [--env ENV] [--img IMAGE] [--name NAME] [--keep-container] [--no-rtk] [--no-ponytail] [--] [tool args...]
 #
 # Examples:
 #   agentcubicle list
@@ -30,6 +30,7 @@
 #   agentcubicle opencode --keep-container
 #   agentcubicle claude --env ANTHROPIC_API_KEY="$(cat ~/.claude-key)"
 #   agentcubicle opencode --mount /etc/ssh:/etc/ssh:ro
+#   agentcubicle opencode --no-ponytail
 #   agentcubicle claude -- --model sonnet
 
 set -euo pipefail
@@ -85,6 +86,7 @@ TOOL=""
 CMD_NAME=""
 KEEP_CONTAINER=false
 NO_RTK=false
+NO_PONYTAIL=false
 
 # Container engine: honor AGENTCUBICLE_ENGINE if set, otherwise auto-detect,
 # preferring podman when both are installed.
@@ -342,6 +344,10 @@ if [[ -z "$COMMAND" ]]; then
         ;;
       --no-rtk)
         NO_RTK=true
+        shift
+        ;;
+      --no-ponytail)
+        NO_PONYTAIL=true
         shift
         ;;
       --)
@@ -766,7 +772,7 @@ if [[ "$TOOL" == "opencode" ]]; then
 fi
 
 # Container-only opencode config override (never touches host config), sent
-# via OPENCODE_CONFIG_CONTENT below. Two things live in it:
+# via OPENCODE_CONFIG_CONTENT below. The things that live in it:
 # - A blanket permission allow. Combined with --agent plan below, this makes
 #   plan mode best-effort rather than a hard guarantee: opencode's own
 #   plan-agent rules deny edits, but this blanket allow is appended after
@@ -777,8 +783,19 @@ fi
 #   opencode merges `instructions` from OPENCODE_CONFIG_CONTENT with any
 #   file-based config's own `instructions` array rather than replacing it,
 #   so this is purely additive even when the project has its own AGENTS.md.
-OPENCODE_CONFIG_JSON=$(jq -nc --arg dir "$CONTAINER_PROJECT_DIR" \
-  '{"permission":{"*":"allow"},"instructions":[$dir + "/.agentcubicle/AGENTS.local.md", $dir + "/.agentcubicle/MEMORY.local.md"]}')
+# ponytail's ruleset (opencode only, on by default) is appended to that same
+# list when enabled; the file itself is written just below.
+_PONYTAIL_INSTRUCTION=""
+if [[ "$TOOL" == "opencode" ]] && ! $NO_PONYTAIL; then
+  _PONYTAIL_INSTRUCTION="$CONTAINER_PROJECT_DIR/.agentcubicle/ponytail.md"
+fi
+if [[ -n "$_PONYTAIL_INSTRUCTION" ]]; then
+  OPENCODE_CONFIG_JSON=$(jq -nc --arg dir "$CONTAINER_PROJECT_DIR" --arg ponytail "$_PONYTAIL_INSTRUCTION" \
+    '{"permission":{"*":"allow"},"instructions":[$dir + "/.agentcubicle/AGENTS.local.md", $dir + "/.agentcubicle/MEMORY.local.md", $ponytail]}')
+else
+  OPENCODE_CONFIG_JSON=$(jq -nc --arg dir "$CONTAINER_PROJECT_DIR" \
+    '{"permission":{"*":"allow"},"instructions":[$dir + "/.agentcubicle/AGENTS.local.md", $dir + "/.agentcubicle/MEMORY.local.md"]}')
+fi
 
 # RTK (https://github.com/rtk-ai/rtk) integration for opencode: a thin plugin
 # that rewrites bash/shell commands to their `rtk` equivalents before execution,
@@ -1015,6 +1032,59 @@ permanently. Then clean up MEMORY.local.md accordingly.
 AGENTS_EOF
 )
 _seed_if_absent "$WORKDIR/.agentcubicle/AGENTS.local.md" "$AGENTS_CONTENT"
+
+# Ponytail (https://github.com/DietrichGebert/ponytail) is a lazy-senior-dev
+# coding ruleset: "the best code is the code you never wrote." Unlike rtk
+# (which ships a binary and a plugin), ponytail is instruction-only, so there
+# is nothing to bake into the image and nothing to wire into opencode's plugin
+# loader. The one thing agentcubicle does is make sure opencode actually reads
+# it: the ruleset is written into the project's already-git-excluded
+# .agentcubicle/ dir and appended to the OPENCODE_CONFIG_CONTENT `instructions`
+# list above (the same channel AGENTS.local.md/MEMORY.local.md use). It is
+# opencode-only on purpose (the claude path is left untouched, matching rtk)
+# and is skipped with --no-ponytail. The content is a verbatim copy of ponytail's
+# AGENTS.md; if the upstream file and this embedded copy drift, update this
+# copy to match upstream, never the reverse. Seeded once like the .local.md
+# files (edits persist, never clobbered), so the instructions path above
+# resolves the same file on every run.
+if [[ "$TOOL" == "opencode" ]] && ! $NO_PONYTAIL; then
+  PONYTAIL_CONTENT=$(cat <<'PONYTAIL_EOF'
+# Ponytail, lazy senior dev mode
+
+You are a lazy senior developer. Lazy means efficient, not careless. The best code is the code never written.
+
+Before writing any code, stop at the first rung that holds:
+
+1. Does this need to be built at all? (YAGNI)
+2. Does it already exist in this codebase? Reuse the helper, util, or pattern that's already here, don't re-write it.
+3. Does the standard library already do this? Use it.
+4. Does a native platform feature cover it? Use it.
+5. Does an already-installed dependency solve it? Use it.
+6. Can this be one line? Make it one line.
+7. Only then: write the minimum code that works.
+
+The ladder runs after you understand the problem, not instead of it: read the task and the code it touches, trace the real flow end to end, then climb.
+
+Bug fix = root cause, not symptom: a report names a symptom. Grep every caller of the function you touch and fix the shared function once — one guard there is a smaller diff than one per caller, and patching only the path the ticket names leaves a sibling caller still broken.
+
+Rules:
+
+- No abstractions that weren't explicitly requested.
+- No new dependency if it can be avoided.
+- No boilerplate nobody asked for.
+- Deletion over addition. Boring over clever. Fewest files possible.
+- Shortest working diff wins, but only once you understand the problem. The smallest change in the wrong place isn't lazy, it's a second bug.
+- Question complex requests: "Do you actually need X, or does Y cover it?"
+- Pick the edge-case-correct option when two stdlib approaches are the same size, lazy means less code, not the flimsier algorithm.
+- Mark deliberate simplifications that cut a real corner with a known ceiling (global lock, O(n²) scan, naive heuristic) with a `ponytail:` comment naming the ceiling and upgrade path.
+
+Not lazy about: understanding the problem (read it fully and trace the real flow before picking a rung, a small diff you don't understand is just laziness dressed up as efficiency), input validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs (the platform is never the spec ideal, a clock drifts, a sensor reads off), anything explicitly requested. Lazy code without its check is unfinished: non-trivial logic leaves ONE runnable check behind, the smallest thing that fails if the logic breaks (an assert-based demo/self-check or one small test file; no frameworks, no fixtures). Trivial one-liners need no test.
+
+(Yes, this file also applies to agents working on the ponytail repo itself. Especially to them.)
+PONYTAIL_EOF
+)
+  _seed_if_absent "$WORKDIR/.agentcubicle/ponytail.md" "$PONYTAIL_CONTENT"
+fi
 
 MEMORY_CONTENT=$(cat <<'MEMORY_EOF'
 # MEMORY.local.md (agentcubicle local file)
